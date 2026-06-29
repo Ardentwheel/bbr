@@ -1024,6 +1024,68 @@ static bool bbr_is_probing_bandwidth(struct sock *sk)
 		  bbr->cycle_idx == BBR_BW_PROBE_UP));
 }
 
+/* ---- LFN guard (shared by upper / lower / startup paths) ---- */
+
+static bool bbr_min_rtt_is_fresh(const struct bbr *bbr)
+{
+	u32 limit_ms;
+
+	if (bbr->min_rtt_stamp == 0)
+		return false;
+	limit_ms = READ_ONCE(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
+	if (limit_ms == 0)
+		return true;
+	return jiffies_to_msecs(tcp_jiffies32 - bbr->min_rtt_stamp) <= limit_ms;
+}
+
+static u32 bbr_inflight_roof(const struct sock *sk)
+{
+	u32 bdp = bbr_inflight((struct sock *)sk, bbr_max_bw(sk), BBR_UNIT);
+	return ((u64)bdp * 115ULL) / 100ULL;
+}
+
+/**
+ * bbr_lfn_eligible - is this loss episode plausibly "physical, not congestion"?
+ *
+ * Upper/lower (PROBE_BW, non-PROBE_UP):
+ *   1) mode == BBR_PROBE_BW && cycle_idx != BBR_BW_PROBE_UP
+ *   2) rtt_us < 1.2 × min_rtt_us   (no queue buildup)
+ *   3) min_rtt fresh
+ *   4) inflight_latest ≤ 1.15 × BDP (not self-inflicted probe overshoot)
+ *
+ * Startup:
+ *   1') mode == BBR_STARTUP
+ *   2') 3') 4')  same as above
+ */
+static bool bbr_lfn_eligible(const struct sock *sk,
+			     const struct rate_sample *rs)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+	bool in_startup, in_probe_bw_steady;
+
+	in_startup = (bbr->mode == BBR_STARTUP);
+	in_probe_bw_steady = (bbr->mode == BBR_PROBE_BW &&
+			      bbr->cycle_idx != BBR_BW_PROBE_UP);
+
+	if (!in_startup && !in_probe_bw_steady)
+		return false;
+	if (!bbr_min_rtt_is_fresh(bbr))
+		return false;
+	if (rs->rtt_us <= 0 || bbr->min_rtt_us <= 0 ||
+	    rs->rtt_us >= (bbr->min_rtt_us * 6 / 5))
+		return false;
+	if (bbr->inflight_latest > bbr_inflight_roof(sk))
+		return false;
+	return true;
+}
+
+/* Convert pct [2..20] to BBR_SCALE fraction (same math as bbr_param loss_thresh) */
+static u32 bbr_pct_to_scale(int pct)
+{
+	pct = clamp(pct, 2, 20);
+	return ((u32)pct * BBR_UNIT + 50) / 100;
+}
+
 /* Has the given amount of time elapsed since we marked the phase start? */
 static bool bbr_has_elapsed_in_phase(const struct sock *sk, u32 interval_us)
 {
@@ -1174,10 +1236,14 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
 {
 	const struct bbr *bbr = inet_csk_ca(sk);
 	u32 loss_thresh, ecn_thresh;
+	u32 eff_loss = bbr_param(sk, loss_thresh);
+	u32 eff_ecn  = bbr_param(sk, ecn_thresh);
+	int pct= READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct);
 
 	if (rs->lost > 0 && rs->tx_in_flight) {
-		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
-				BBR_SCALE;
+		if (pct > 0 && bbr_lfn_eligible(sk, rs))
+			eff_loss = max_t(u32, eff_loss, bbr_pct_to_scale(pct));
+		loss_thresh = (u64)rs->tx_in_flight * eff_loss >> BBR_SCALE;
 		if (rs->lost > loss_thresh) {
 			return true;
 		}
@@ -1185,8 +1251,9 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
 
 	if (rs->delivered_ce > 0 && rs->delivered > 0 &&
 	    bbr->ecn_eligible && !!bbr_param(sk, ecn_thresh)) {
-		ecn_thresh = (u64)rs->delivered * bbr_param(sk, ecn_thresh) >>
-				BBR_SCALE;
+		if (pct > 0 && bbr_lfn_eligible(sk, rs))
+			eff_ecn = max_t(u32, eff_ecn, bbr_pct_to_scale(pct));
+		ecn_thresh = (u64)rs->delivered * eff_ecn >> BBR_SCALE;
 		if (rs->delivered_ce > ecn_thresh) {
 			return true;
 		}
@@ -1333,10 +1400,20 @@ static void bbr_init_lower_bounds(struct sock *sk, bool init_bw)
 }
 
 /* Reduce bw and inflight to (1 - beta). */
-static void bbr_loss_lower_bounds(struct sock *sk, u32 *bw, u32 *inflight)
+static void bbr_loss_lower_bounds(struct sock *sk,
+				  const struct rate_sample *rs,
+				  u32 *bw, u32 *inflight)
 {
 	struct bbr* bbr = inet_csk_ca(sk);
 	u32 loss_cut = BBR_UNIT - bbr_param(sk, beta);
+
+	/* LFN: if eligible, skip the (1-beta) cut entirely */
+	if (READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct) > 0 &&
+	    bbr_lfn_eligible(sk, rs)) {
+		*bw = bbr->bw_lo;
+		*inflight = bbr->inflight_lo;
+		return;
+	}
 
 	*bw = max_t(u32, bbr->bw_latest,
 		    (u64)bbr->bw_lo * loss_cut >> BBR_SCALE);
@@ -1390,7 +1467,7 @@ static void bbr_adapt_lower_bounds(struct sock *sk,
 	/* Loss response. */
 	if (bbr->loss_in_round) {
 		bbr_init_lower_bounds(sk, true);
-		bbr_loss_lower_bounds(sk, &bbr->bw_lo, &bbr->inflight_lo);
+		bbr_loss_lower_bounds(sk, rs, &bbr->bw_lo, &bbr->inflight_lo);
 	}
 
 	/* Adjust to the lower of the levels implied by loss/ECN. */
@@ -1685,6 +1762,13 @@ static bool bbr_adapt_upper_bounds(struct sock *sk,
 		}
 	}
 	if (bbr_is_inflight_too_high(sk, rs)) {
+		/* LFN: if eligible, skip the inflight_hi freeze entirely.
+		 * Symmetric with bbr_loss_lower_bounds() exemption.
+		 */
+		if (READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct) > 0 &&
+		    bbr_lfn_eligible(sk, rs))
+			return false;
+
 		if (bbr->bw_probe_samples)  /*  sample is from bw probing? */
 			bbr_handle_inflight_too_high(sk, rs);
 	} else {

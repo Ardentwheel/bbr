@@ -46,6 +46,12 @@ static unsigned int udp_child_hash_entries_max = UDP_HTABLE_SIZE_MAX;
 static int tcp_plb_max_rounds = 31;
 static int tcp_plb_max_cong_thresh = 256;
 
+/* BBR LFN loss tolerance parameters (global, not per-netns) */
+int sysctl_tcp_bbr_lfn_loss_thresh_pct __read_mostly = 0;
+int sysctl_tcp_bbr_lfn_min_rtt_fresh_ms __read_mostly = 15000;
+EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_loss_thresh_pct);
+EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
+
 /* obsolete */
 static int sysctl_tcp_low_latency __read_mostly;
 
@@ -594,6 +600,24 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif /* CONFIG_NETLABEL */
+	{
+		.procname	= "tcp_bbr_lfn_loss_thresh_pct",
+		.data		= &sysctl_tcp_bbr_lfn_loss_thresh_pct,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &(int){20},
+	},
+	{
+		.procname	= "tcp_bbr_lfn_min_rtt_fresh_ms",
+		.data		= &sysctl_tcp_bbr_lfn_min_rtt_fresh_ms,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &(int){60000},
+	},
 	{
 		.procname	= "tcp_available_ulp",
 		.maxlen		= TCP_ULP_BUF_MAX,
